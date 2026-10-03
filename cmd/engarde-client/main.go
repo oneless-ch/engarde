@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -42,7 +43,21 @@ type sendingRoutine struct {
 	DstAddr   *net.UDPAddr
 	LastRec   int64
 	IsClosing bool
+	// Queue decouples this link from the others: the WireGuard reader only
+	// enqueues (never blocks), and this link's own goroutine does the socket
+	// write. A stalled link fills its own queue and drops its own copies; the
+	// other links keep sending the same packets at full speed.
+	Queue   chan []byte
+	Done    chan struct{}
+	Dropped uint64 // copies this link dropped: queue full or write deadline missed
 }
+
+// sendQueueLen bounds how far one link may lag. It must absorb a burst (a
+// remote-desktop keyframe arrives as a few hundred packets at once) without
+// dropping on a healthy link; beyond it, a stalled link only drops its own
+// stale copies — another link has delivered them, or WireGuard's replay
+// window would discard them anyway. 512 × ~1.3 kB ≈ 0.6 MB per link.
+const sendQueueLen = 512
 
 var sendingChannels map[string]*sendingRoutine
 var clConfig clientConfig
@@ -145,7 +160,10 @@ func listInterfaces() {
 }
 
 func terminateRoutine(routine *sendingRoutine, ifname string, deleteFromSlice bool) {
-	routine.IsClosing = true
+	if !routine.IsClosing {
+		routine.IsClosing = true
+		close(routine.Done)
+	}
 	routine.SrcSock.Close()
 	if deleteFromSlice {
 		sendingChannelsMutex.Lock()
@@ -225,10 +243,13 @@ func createSendThread(ifname, sourceAddr string, wgSock *net.UDPConn, wgAddr **n
 		SrcAddr:   sourceAddr,
 		DstAddr:   dstAddr,
 		IsClosing: false,
+		Queue:     make(chan []byte, sendQueueLen),
+		Done:      make(chan struct{}),
 	}
 	ptrRoutine := &routine
 
 	go wgWriteBack(ifname, ptrRoutine, wgSock, wgAddr)
+	go linkSender(ifname, ptrRoutine)
 	sendingChannelsMutex.Lock()
 	sendingChannels[ifname] = ptrRoutine
 	sendingChannelsMutex.Unlock()
@@ -256,43 +277,60 @@ func wgWriteBack(ifname string, routine *sendingRoutine, wgSock *net.UDPConn, wg
 	}
 }
 
+// linkSender owns one link's socket writes. A missed write deadline is not an
+// error here: the copy is dropped and counted, and the socket stays (the old
+// loop tore the socket down and re-bound a new port on every timeout, which
+// stalled every link and churned the server's client table). Only a real
+// write error re-creates the socket.
+func linkSender(ifname string, routine *sendingRoutine) {
+	for {
+		select {
+		case <-routine.Done:
+			return
+		case pkt := <-routine.Queue:
+			if clConfig.WriteTimeout > 0 {
+				_ = routine.SrcSock.SetWriteDeadline(time.Now().Add(clConfig.WriteTimeout * time.Millisecond))
+			}
+			_, err := routine.SrcSock.WriteToUDP(pkt, routine.DstAddr)
+			if err == nil {
+				continue
+			}
+			if routine.IsClosing {
+				return
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				atomic.AddUint64(&routine.Dropped, 1)
+				continue
+			}
+			log.WithError(err).Warn("Error writing to '" + ifname + "', re-creating socket")
+			terminateRoutine(routine, ifname, true)
+			return
+		}
+	}
+}
+
 func receiveFromWireguard(wgsock *net.UDPConn, sourceAddr **net.UDPAddr) {
 	buffer := make([]byte, 1500)
-	var n int
-	var srcAddr *net.UDPAddr
-	var routine *sendingRoutine
-	var err error
-	var ifname string
-	var toDelete []string
 	for {
-		n, srcAddr, err = wgsock.ReadFromUDP(buffer)
+		n, srcAddr, err := wgsock.ReadFromUDP(buffer)
 		if err != nil {
 			log.Warn("Error reading from Wireguard")
 			continue
 		}
 		*sourceAddr = srcAddr
+		// One copy per packet, shared read-only by every link's sender.
+		pkt := make([]byte, n)
+		copy(pkt, buffer[:n])
 		sendingChannelsMutex.RLock()
-		for ifname, routine = range sendingChannels {
-			if clConfig.WriteTimeout > 0 {
-				err = routine.SrcSock.SetWriteDeadline(time.Now().Add(clConfig.WriteTimeout * time.Millisecond))
-				if err != nil {
-					log.WithError(err).Warn("Error setting source socket write deadline to " + clConfig.WriteTimeout.String())
-				}
-			}
-			_, err = routine.SrcSock.WriteToUDP(buffer[:n], routine.DstAddr)
-			if err != nil {
-				log.Warn("Error writing to '" + ifname + "', re-creating socket")
-				terminateRoutine(routine, ifname, false)
-				toDelete = append(toDelete, ifname)
+		for _, routine := range sendingChannels {
+			select {
+			case routine.Queue <- pkt:
+			default:
+				// This link is behind: drop its copy, never wait for it.
+				atomic.AddUint64(&routine.Dropped, 1)
 			}
 		}
 		sendingChannelsMutex.RUnlock()
-		sendingChannelsMutex.Lock()
-		for _, ifname = range toDelete {
-			delete(sendingChannels, ifname)
-		}
-		toDelete = toDelete[:0]
-		sendingChannelsMutex.Unlock()
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync/atomic"
 	"crypto/subtle"
 	"encoding/json"
 	"io"
@@ -20,6 +21,9 @@ type webInterface struct {
 	SenderAddress string `json:"senderAddress"`
 	DstAddress    string `json:"dstAddress"`
 	Last          *int64 `json:"last"`
+	// Dropped counts this link's copies dropped because it was behind (queue
+	// full or write deadline missed); the other links carried them.
+	Dropped uint64 `json:"dropped"`
 }
 
 func getLabelByIfname(ifname string) string {
@@ -102,6 +106,7 @@ func webGetList(w http.ResponseWriter, r *http.Request) {
 				Status:        "active",
 				SenderAddress: address,
 				DstAddress:    getDstByIfname(ifname),
+				Dropped:       atomic.LoadUint64(&routine.Dropped),
 			}
 			if routine.LastRec > 0 {
 				rspIface.Last = &respLast
