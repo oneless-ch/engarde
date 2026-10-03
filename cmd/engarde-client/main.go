@@ -47,8 +47,9 @@ type sendingRoutine struct {
 	// enqueues (never blocks), and this link's own goroutine does the socket
 	// write. A stalled link fills its own queue and drops its own copies; the
 	// other links keep sending the same packets at full speed.
-	Queue   chan []byte
-	Done    chan struct{}
+	Queue     chan []byte
+	Done      chan struct{}
+	closeOnce sync.Once
 	Dropped uint64 // copies this link dropped: queue full or write deadline missed
 }
 
@@ -160,10 +161,12 @@ func listInterfaces() {
 }
 
 func terminateRoutine(routine *sendingRoutine, ifname string, deleteFromSlice bool) {
-	if !routine.IsClosing {
+	// wgWriteBack (read error) and linkSender (write error) can both get here
+	// for the same dying link at the same instant: close Done exactly once.
+	routine.closeOnce.Do(func() {
 		routine.IsClosing = true
 		close(routine.Done)
-	}
+	})
 	routine.SrcSock.Close()
 	if deleteFromSlice {
 		sendingChannelsMutex.Lock()
