@@ -51,6 +51,12 @@ type sendingRoutine struct {
 	Done      chan struct{}
 	closeOnce sync.Once
 	Dropped uint64 // copies this link dropped: queue full or write deadline missed
+	// Sent and Received count datagrams that crossed this link's socket. A
+	// modem accepts every send and loses packets later, so Dropped alone
+	// cannot show a bad link; Received, compared with what WireGuard got,
+	// can. All three restart at 0 when the link's socket is re-created.
+	Sent     uint64
+	Received uint64
 }
 
 // sendQueueLen bounds how far one link may lag. It must absorb a burst (a
@@ -273,6 +279,7 @@ func wgWriteBack(ifname string, routine *sendingRoutine, wgSock *net.UDPConn, wg
 			return
 		}
 		routine.LastRec = time.Now().Unix()
+		atomic.AddUint64(&routine.Received, 1)
 		_, err = wgSock.WriteToUDP(buffer[:n], *wgAddr)
 		if err != nil {
 			log.Warn("Error writing to WireGuard")
@@ -296,6 +303,7 @@ func linkSender(ifname string, routine *sendingRoutine) {
 			}
 			_, err := routine.SrcSock.WriteToUDP(pkt, routine.DstAddr)
 			if err == nil {
+				atomic.AddUint64(&routine.Sent, 1)
 				continue
 			}
 			if routine.IsClosing {

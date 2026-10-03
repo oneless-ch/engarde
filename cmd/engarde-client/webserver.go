@@ -24,6 +24,10 @@ type webInterface struct {
 	// Dropped counts this link's copies dropped because it was behind (queue
 	// full or write deadline missed); the other links carried them.
 	Dropped uint64 `json:"dropped"`
+	// Sent and Received count datagrams written to and read from this link's
+	// socket since it was last created.
+	Sent     uint64 `json:"sent"`
+	Received uint64 `json:"received"`
 }
 
 func getLabelByIfname(ifname string) string {
@@ -107,6 +111,8 @@ func webGetList(w http.ResponseWriter, r *http.Request) {
 				SenderAddress: address,
 				DstAddress:    getDstByIfname(ifname),
 				Dropped:       atomic.LoadUint64(&routine.Dropped),
+				Sent:          atomic.LoadUint64(&routine.Sent),
+				Received:      atomic.LoadUint64(&routine.Received),
 			}
 			if routine.LastRec > 0 {
 				rspIface.Last = &respLast
