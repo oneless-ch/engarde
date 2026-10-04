@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/porech/engarde/v2/internal/linkreport"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
@@ -65,6 +66,11 @@ type sendingRoutine struct {
 // stale copies — another link has delivered them, or WireGuard's replay
 // window would discard them anyway. 512 × ~1.3 kB ≈ 0.6 MB per link.
 const sendQueueLen = 512
+
+// linkReportEvery is how often each link tells the server who it is and what
+// it has counted (internal/linkreport). Reports are not data: they never
+// enter Sent or Received, so both ends' counters stay comparable.
+const linkReportEvery = 5 * time.Second
 
 var sendingChannels map[string]*sendingRoutine
 var clConfig clientConfig
@@ -278,6 +284,9 @@ func wgWriteBack(ifname string, routine *sendingRoutine, wgSock *net.UDPConn, wg
 			terminateRoutine(routine, ifname, true)
 			return
 		}
+		if linkreport.IsReport(buffer[:n]) {
+			continue // control traffic: never WireGuard's, never counted
+		}
 		routine.LastRec = time.Now().Unix()
 		atomic.AddUint64(&routine.Received, 1)
 		_, err = wgSock.WriteToUDP(buffer[:n], *wgAddr)
@@ -293,10 +302,14 @@ func wgWriteBack(ifname string, routine *sendingRoutine, wgSock *net.UDPConn, wg
 // stalled every link and churned the server's client table). Only a real
 // write error re-creates the socket.
 func linkSender(ifname string, routine *sendingRoutine) {
+	report := time.NewTicker(linkReportEvery)
+	defer report.Stop()
 	for {
 		select {
 		case <-routine.Done:
 			return
+		case <-report.C:
+			sendLinkReport(ifname, routine)
 		case pkt := <-routine.Queue:
 			if clConfig.WriteTimeout > 0 {
 				_ = routine.SrcSock.SetWriteDeadline(time.Now().Add(clConfig.WriteTimeout * time.Millisecond))
@@ -318,6 +331,26 @@ func linkSender(ifname string, routine *sendingRoutine) {
 			return
 		}
 	}
+}
+
+// sendLinkReport writes this link's report on its own socket. Best effort: a
+// failed report is simply missing from the server's view until the next one;
+// a dead socket is the data path's to notice and re-create.
+func sendLinkReport(ifname string, routine *sendingRoutine) {
+	name := getLabelByIfname(ifname)
+	if name == "" {
+		name = ifname
+	}
+	msg := linkreport.Encode(linkreport.Report{
+		Name:     name,
+		Sent:     atomic.LoadUint64(&routine.Sent),
+		Received: atomic.LoadUint64(&routine.Received),
+		Dropped:  atomic.LoadUint64(&routine.Dropped),
+	})
+	if clConfig.WriteTimeout > 0 {
+		_ = routine.SrcSock.SetWriteDeadline(time.Now().Add(clConfig.WriteTimeout * time.Millisecond))
+	}
+	_, _ = routine.SrcSock.WriteToUDP(msg, routine.DstAddr)
 }
 
 func receiveFromWireguard(wgsock *net.UDPConn, sourceAddr **net.UDPAddr) {

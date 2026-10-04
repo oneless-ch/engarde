@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/porech/engarde/v2/internal/assets"
@@ -13,8 +14,25 @@ import (
 )
 
 type webSocket struct {
-	Address string `json:"address"`
-	Last    *int64 `json:"last"`
+	Address           string   `json:"address"`
+	Last              *int64   `json:"last"`
+	SentTo            uint64   `json:"sentTo"`
+	ReceivedFrom      uint64   `json:"receivedFrom"`
+	SentToBytes       uint64   `json:"sentToBytes"`
+	ReceivedFromBytes uint64   `json:"receivedFromBytes"`
+	Link              *webLink `json:"link,omitempty"`
+}
+
+// webLink is the latest link report for an address, with this server's
+// counters as they stood when it arrived (see linkSample).
+type webLink struct {
+	Name               string `json:"name"`
+	ClientSent         uint64 `json:"clientSent"`
+	ClientReceived     uint64 `json:"clientReceived"`
+	ClientDropped      uint64 `json:"clientDropped"`
+	ServerSentTo       uint64 `json:"serverSentTo"`
+	ServerReceivedFrom uint64 `json:"serverReceivedFrom"`
+	At                 int64  `json:"at"` // unix milliseconds
 }
 
 func webBasicAuth(handler http.HandlerFunc, username, password, realm string) http.HandlerFunc {
@@ -58,16 +76,33 @@ func webHandleFileServer(webFS fs.FS) http.HandlerFunc {
 
 func webGetList(w http.ResponseWriter, r *http.Request) {
 	rspSockets := []webSocket{}
+	// The table is written by the client reader; read it under the lock.
+	clientsMutex.RLock()
 	for address, client := range clients {
-		last := time.Now().Unix() - client.Last
+		lastSeen := atomic.LoadInt64(&client.Last)
+		last := time.Now().Unix() - lastSeen
 		rspSocket := webSocket{
-			Address: address,
+			Address:           address,
+			SentTo:            atomic.LoadUint64(&client.SentTo),
+			ReceivedFrom:      atomic.LoadUint64(&client.ReceivedFrom),
+			SentToBytes:       atomic.LoadUint64(&client.SentToBytes),
+			ReceivedFromBytes: atomic.LoadUint64(&client.ReceivedFromBytes),
 		}
-		if client.Last > 0 {
+		if lastSeen > 0 {
 			rspSocket.Last = &last
 		}
+		client.reportMu.Lock()
+		if s := client.report; s != nil {
+			rspSocket.Link = &webLink{
+				Name: s.Name, ClientSent: s.Sent, ClientReceived: s.Received,
+				ClientDropped: s.Dropped, ServerSentTo: s.ServerSentTo,
+				ServerReceivedFrom: s.ServerReceivedFrom, At: s.At,
+			}
+		}
+		client.reportMu.Unlock()
 		rspSockets = append(rspSockets, rspSocket)
 	}
+	clientsMutex.RUnlock()
 
 	rspObject := struct {
 		Type          string      `json:"type"`
