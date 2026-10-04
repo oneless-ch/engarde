@@ -5,8 +5,10 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/porech/engarde/v2/internal/linkreport"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
@@ -28,10 +30,30 @@ type serverConfig struct {
 	} `yaml:"webManager"`
 }
 
-// ConnectedClient contains the information about a client
+// ConnectedClient contains the information about a client: one address the
+// laptop's links send from. The 64-bit fields come first so their atomic
+// access stays 8-byte aligned on 32-bit builds (mips, arm).
 type ConnectedClient struct {
-	Addr *net.UDPAddr
-	Last int64
+	Last int64 // unix seconds of the last datagram from Addr; atomic
+	// SentTo/ReceivedFrom count data datagrams written to and read from Addr,
+	// and the *Bytes pair their payload; link reports are never counted.
+	SentTo            uint64
+	ReceivedFrom      uint64
+	SentToBytes       uint64
+	ReceivedFromBytes uint64
+	Addr              *net.UDPAddr
+	reportMu          sync.Mutex
+	report            *linkSample
+}
+
+// linkSample is the latest report from the client link behind an address,
+// paired with this server's own counters for that address at the instant it
+// arrived — both halves of a delivery ratio sampled at the same moment.
+type linkSample struct {
+	linkreport.Report
+	ServerSentTo       uint64
+	ServerReceivedFrom uint64
+	At                 int64 // unix milliseconds
 }
 
 var clients map[string]*ConnectedClient
@@ -124,39 +146,62 @@ func main() {
 	receiveFromClient(ClientSocket, WireguardSocket, WireguardAddr)
 }
 
+// handleClientDatagram books one datagram from a client address and says
+// whether it is WireGuard traffic to forward. A link report is consumed here
+// and never forwarded. It annotates an address that data already registered
+// and never registers one itself: any UDP source can reach this port, and an
+// address in the table receives every downstream copy.
+func handleClientDatagram(buf []byte, srcAddr *net.UDPAddr, now time.Time) bool {
+	srcAddrS := srcAddr.IP.String() + ":" + strconv.Itoa(srcAddr.Port)
+	clientsMutex.RLock()
+	client, exists := clients[srcAddrS]
+	clientsMutex.RUnlock()
+
+	if linkreport.IsReport(buf) {
+		if !exists {
+			return false
+		}
+		r, err := linkreport.Decode(buf)
+		if err != nil {
+			return false
+		}
+		atomic.StoreInt64(&client.Last, now.Unix())
+		sample := &linkSample{
+			Report:             r,
+			ServerSentTo:       atomic.LoadUint64(&client.SentTo),
+			ServerReceivedFrom: atomic.LoadUint64(&client.ReceivedFrom),
+			At:                 now.UnixNano() / int64(time.Millisecond),
+		}
+		client.reportMu.Lock()
+		client.report = sample
+		client.reportMu.Unlock()
+		return false
+	}
+
+	if exists {
+		atomic.StoreInt64(&client.Last, now.Unix())
+	} else {
+		log.Info("New client connected: '" + srcAddrS + "'")
+		client = &ConnectedClient{Addr: srcAddr, Last: now.Unix()}
+		clientsMutex.Lock()
+		clients[srcAddrS] = client
+		clientsMutex.Unlock()
+	}
+	atomic.AddUint64(&client.ReceivedFrom, 1)
+	atomic.AddUint64(&client.ReceivedFromBytes, uint64(len(buf)))
+	return true
+}
+
 func receiveFromClient(socket, wgSocket *net.UDPConn, wgAddr *net.UDPAddr) {
 	buffer := make([]byte, 1500)
-	var currentTime int64
-	var n int
-	var srcAddr *net.UDPAddr
-	var srcAddrS string
-	var client *ConnectedClient
-	var exists bool
-	var err error
 	for {
-		n, srcAddr, err = socket.ReadFromUDP(buffer)
+		n, srcAddr, err := socket.ReadFromUDP(buffer)
 		if err != nil {
 			log.Warn("Error reading from client")
 			continue
 		}
-
-		// Check if client exists
-		currentTime = time.Now().Unix()
-		srcAddrS = srcAddr.IP.String() + ":" + strconv.Itoa(srcAddr.Port)
-		clientsMutex.RLock()
-		client, exists = clients[srcAddrS]
-		clientsMutex.RUnlock()
-		if exists {
-			client.Last = currentTime
-		} else {
-			log.Info("New client connected: '" + srcAddrS + "'")
-			newClient := ConnectedClient{
-				Addr: srcAddr,
-				Last: currentTime,
-			}
-			clientsMutex.Lock()
-			clients[srcAddrS] = &newClient
-			clientsMutex.Unlock()
+		if !handleClientDatagram(buffer[:n], srcAddr, time.Now()) {
+			continue
 		}
 		_, err = wgSocket.WriteToUDP(buffer[:n], wgAddr)
 		if err != nil {
@@ -182,7 +227,7 @@ func receiveFromWireguard(wgSocket, socket *net.UDPConn) {
 		currentTime = time.Now().Unix()
 		clientsMutex.RLock()
 		for clientAddr, client = range clients {
-			if client.Last > currentTime-srConfig.ClientTimeout {
+			if atomic.LoadInt64(&client.Last) > currentTime-srConfig.ClientTimeout {
 				if srConfig.WriteTimeout > 0 {
 					err = socket.SetWriteDeadline(time.Now().Add(srConfig.WriteTimeout * time.Millisecond))
 					if err != nil {
@@ -193,6 +238,9 @@ func receiveFromWireguard(wgSocket, socket *net.UDPConn) {
 				if err != nil {
 					log.Warn("Error writing to client '" + clientAddr + "', terminating it")
 					toDelete = append(toDelete, clientAddr)
+				} else {
+					atomic.AddUint64(&client.SentTo, 1)
+					atomic.AddUint64(&client.SentToBytes, uint64(n))
 				}
 			} else {
 				log.Info("Client '" + clientAddr + "' timed out")
